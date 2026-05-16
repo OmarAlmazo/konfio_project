@@ -1,0 +1,13 @@
+#version: '3.8'
+
+services:
+  spark-iceberg-pipeline:
+    build: .
+    volumes:
+      - .:/app
+      - ./warehouse:/app/warehouse
+    environment:
+      # Aquí se define el paquete específico de Iceberg para Spark 3.5 [cite: 128]
+      - PYSPARK_SUBMIT_ARGS=--packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.3 pyspark-shell
+      - PYTHONPATH=/app/src
+    container_name: konfio_pipeline

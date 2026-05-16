@@ -1,0 +1,16 @@
+# Spark/Hadoop
+warehouse/
+derby.log
+metastore_db/
+checkpoint/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# Docker
+.docker/
