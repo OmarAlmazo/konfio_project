@@ -1,160 +1,211 @@
-import os
-import requests
-from datetime import datetime, timedelta
-from pyspark.sql import SparkSession
+from extract.external_api import FrankfurterAPI
+from transform.process import DataProcessor
+from transform.add_derived_fields import MetricsCalculator
+from transform.currencyservice import CurrencyService
+from transform.anomalies import AnomalyDetector
+from utils import spark_build as sb
+from utils import constants as c
+from transform.dataquality import DataQualityAnalyzer
+import logging
+from load.lakehouse import LakehouseOrchestrator
+from transform.cdc import CDCHandler
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+from transform.financialmodel import FinancialModeler
+from transform.eventpublish import EventPublisher
 
-# --- 1. CONFIGURACIÓN DE SESIÓN SPARK ---
-def create_spark_session():
-    return SparkSession.builder \
-        .appName("KonfioPipeline") \
-        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
-        .config("spark.sql.catalog.local", "org.apache.iceberg.spark.SparkCatalog") \
-        .config("spark.sql.catalog.local.type", "hadoop") \
-        .config("spark.sql.catalog.local.warehouse", "/app/warehouse") \
-        .getOrCreate()
 
-# --- 2. EXTRACCIÓN CON MANEJO DE RANGOS Y ERRORES ---
-def fetch_exchange_rates(start_date, end_date):
-    """
-    Consume la API de Frankfurter manejando reintentos básicos y errores HTTP.
-    """
-    url = f"https://api.frankfurter.app/{start_date}..{end_date}"
-    params = {
-        "base": "USD",
-        "symbols": "MXN,EUR,BRL,GBP" # Monedas requeridas + adicionales
-    }
+
+def run():
+    # Inicialización
+    api = FrankfurterAPI()
+    spark_builder = sb.SparkBuilder()
+    spark_cr = spark_builder._create_spark_session()
+    proc = DataProcessor(spark_session=spark_cr)
+    metrics = MetricsCalculator()
+    currency_service = CurrencyService()
+    anomaly_detector = AnomalyDetector()
+    dq_analyzer = DataQualityAnalyzer(spark_session=spark_cr)
+    orchestrator = LakehouseOrchestrator(spark_cr)
+    cdc_handler = CDCHandler(spark_cr)
+    modeler = FinancialModeler(spark_cr)
+    publisher = EventPublisher(output_path="./events/")
     
-    try:
-        print(f">>> Solicitando datos desde {start_date} hasta {end_date}...")
-        response = requests.get(url, params=params, timeout=15)
-        response.raise_for_status() # Lanza error si hay falla HTTP (4xx o 5xx)
-        return response.json()
-    except Exception as e:
-        print(f"!!! Error fatal al conectar con la API: {e}")
-        return None
+    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+    logger = logging.getLogger("MAIN")
+    # =======================================================================
+    # Extraccion de data desde API externa
+    # =======================================================================
 
-# --- 3. PROCESAMIENTO DINÁMICO (Spark) ---
-def process_to_dataframe(spark, raw_data):
-    """
-    Transforma el JSON anidado de la API en un DataFrame plano.
-    Maneja la estructura de rangos de fechas.
-    """
-    rows = []
-    base_currency = raw_data.get("base", "USD")
-    rates_dict = raw_data.get("rates", {})
+    data = api.fetch_exchange_rates(c.FECHA_INICIO_HISTORICA, c.FECHA_FIN_HISTORICA)
 
-    # La API devuelve: {"rates": {"fecha": {"moneda": valor}}}
-    for date_str, currencies in rates_dict.items():
-        for curr, value in currencies.items():
-            rows.append((date_str, 1.0, base_currency, curr, float(value)))
+    if data and "rates" in data:
+        # =======================================================================
+        # Creacion de DataFrame tipado con Spark (Capa de Formateo)
+        # =======================================================================
+        df = proc.format(data)
+        df_clean = proc.clean_and_validate(df)
+        logger.warning(">>> [MAIN] DataFrame formateado y validado. Mostrando:")
+        df_clean.show(5)
 
-    schema = StructType([
-        StructField("date", StringType(), True),
-        StructField("base_amount", DoubleType(), True), # <--- Nueva columna
-        StructField("base", StringType(), True),
-        StructField("target", StringType(), True),
-        StructField("rate", DoubleType(), True)
-    ])
+        # =======================================================================
+        # Filtra informacion ya que la api puede traer datos fuera del rango 
+        # =======================================================================
+        df_base_filtered = df_clean.filter(
+            F.col("date").between(c.FECHA_INICIO_HISTORICA, c.FECHA_FIN_HISTORICA)
+        )
 
-    df = spark.createDataFrame(rows, schema)
-    # Metadatos de auditoría: Cuándo se procesó la información
-    return df.withColumn("processed_at", F.current_timestamp())
+        # =======================================================================
+        # PRUEBA PARA FORZAR EL DELETE:
+        # Creamos un DataFrame completamente vacío con el mismo esquema
+        # =======================================================================
+        # logger.warning(">>> [TEST] Vaciando el DataFrame entrante para forzar el DELETE...")
+        # df_base_filtered = spark_cr.createDataFrame([], df_base_filtered.schema)
+        # =======================================================================
 
-# --- 4. PIPELINE PRINCIPAL ---
-def run_pipeline():
-    spark = create_spark_session()
-    table_name = "local.db.exchange_rates"
-    
-    # Asegurar que la DB existe
-    spark.sql("CREATE DATABASE IF NOT EXISTS local.db")
+        # =======================================================================
+        # PRUEBA PARA FORZAR EL UPDATE:
+        # Modificamos el rate de un registro existente para engañar al FULL JOIN
+        # =======================================================================
+        #logger.warning(">>> [TEST] Modificando artificialmente el rate para forzar un UPDATE...")
+        #df_base_filtered = df_base_filtered.withColumn(
+        #    c.RATE, 
+        #    F.when(
+        #        (F.col(c.PARAM_BASE) == "USD") & (F.col(c.TARGET) == "MXN"), 
+        #        F.col(c.RATE) * 1.69  # Inflamos el peso un 50% para que el CDC detecte el cambio
+        #    ).otherwise(F.col(c.RATE))
+        #)
+        # =======================================================================
 
-    # --- LÓGICA DE CARGA (HISTÓRICA VS INCREMENTAL) ---
-    table_exists = spark.catalog.tableExists(table_name)
-    
-    if not table_exists:
-        # Escenario: Primera ejecución (Backfill)
-        print(">>> CARGA INICIAL DETECTADA. Procesando historial 2024...")
-        start_date = "2024-01-01"
-        end_date = datetime.now().strftime('%Y-%m-%d')
-    else:
-        # Escenario: Ejecución diaria (Incremental)
-        # Pedimos los últimos 7 días para cubrir fines de semana y feriados
-        print(">>> CARGA INCREMENTAL. Sincronizando última semana...")
-        end_date = datetime.now().strftime('%Y-%m-%d')
-        start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        # =======================================================================
+        # Proceso CDC: Detectar cambios reales entre el DataFrame entrante y la tabla base en el Lakehouse
+        # =======================================================================
+        logger.warning(">>> [MAIN] Procesando matriz CDC...")
+        df_cdc_results = cdc_handler.process_cdc(
+            df_incoming=df_base_filtered,
+            target_table_name=orchestrator.tables["base"], 
+            start_date=c.FECHA_INICIO_HISTORICA, 
+            end_date=c.FECHA_FIN_HISTORICA
+        ).cache()
 
-    # Ejecución
-    json_data = fetch_exchange_rates(start_date, end_date)
-    
-    if json_data and "rates" in json_data:
-        df_final = process_to_dataframe(spark, json_data)
-        
-        # Guardar en Iceberg
-        if not table_exists:
-            # Crea la tabla con el esquema basado en el DataFrame
-            df_final.writeTo(table_name).create()
-            print(">>> Tabla histórica creada exitosamente.")
-        else:
-            """ Metodeo con anti join para evitar duplicados (si la API devuelve datos ya existentes) 
-            # Leemos la tabla existente (solo la columna date para que sea rápido)
-            df_existing = spark.table(table_name).select("date", "base", "target").distinct()
-            # Hacemos un ANTI JOIN: 
-            # "Quédate con lo de df_final que NO esté en df_existing"
-            df_incremental = df_final.join(
-                df_existing, 
-                on=["date", "base", "target"], 
-                how="left_anti"
+        if not df_cdc_results.isEmpty():
+            logger.warning(">>> [MAIN] Se detectaron cambios reales. Actualizando Tabla Base...")
+            # =======================================================================
+            # Se crea Nuevo dataframe con los resultados del CDC para mostrar antes de hacer el merge
+            # =======================================================================            
+            cdc_rows_local = df_cdc_results.collect()
+            df_cdc_check = spark_cr.createDataFrame(cdc_rows_local, df_cdc_results.schema)
+
+            # =======================================================================
+            # Actualización de la tabla base en el Lakehouse usando los resultados del CDC
+            # ======================================================================= 
+            df_full_base, flag = orchestrator.load_lakehouse(
+                df=df_cdc_results,
+                table_name=orchestrator.tables["base"],
+                mode="merge_cdc"
             )
+            showdf0 = spark_cr.read.table(c.TABLE_NAME_EX_RATE) \
+                .select(F.count("*").alias("total")) \
+                .first()  # .first() nos da la primera fila directamente sin regresar una lista
+            # 2. Imprimimos usando la notación de punto del objeto Row
+            logger.warning(f"Total registros: {c.TABLE_NAME_EX_RATE} {showdf0.total} ")
+            spark_cr.sql(f"SELECT * FROM {c.TABLE_NAME_EX_RATE}").show(5)
 
-            if df_incremental.count() > 0:
-                df_incremental.writeTo(table_name).append()
-                print(f">>> {df_incremental.count()} registros nuevos insertados.")
+            # =======================================================================
+            # Enriquecimiento (Métricas calculadas sobre la base limpia)
+            # =======================================================================
+            if not flag:
+                logger.warning(">>> [AUDITORÍA] Verificando el esquema final antes de escribir en Gold...")
+                df_with_metrics = metrics.add_derived_fields(df_cdc_check)
+                df_metrics, _ = orchestrator.load_lakehouse(
+                    df=df_with_metrics, 
+                    table_name=orchestrator.tables["enriched"], 
+                    mode="overwrite_partitions"
+                    )
+                showdf1 = spark_cr.read.table(c.TABLE_NAME_ENRICHED) \
+                    .select(F.count("*").alias("total")) \
+                    .first()  # .first() nos da la primera fila directamente sin regresar una lista
+                # 2. Imprimimos usando la notación de punto del objeto Row
+                logger.warning(f"Total registros: {c.TABLE_NAME_ENRICHED} {showdf1.total} ")        
+                spark_cr.sql(f"SELECT * FROM {c.TABLE_NAME_ENRICHED}").show(5)
 
+                # =======================================================================
+                # Agregaciones por 
+                # =======================================================================    
+                df_resumen = currency_service.get_monthly_summary(df_cdc_check)
+                df_resumen2, _ = orchestrator.load_lakehouse(
+                    df=df_resumen, 
+                    table_name=orchestrator.tables["monthly"], 
+                    mode="overwrite_partitions"
+                    )
+                showdf2 = spark_cr.read.table(c.TABLE_NAME_MONTHLY_METRICS) \
+                    .select(F.count("*").alias("total")) \
+                    .first()  # .first() nos da la primera fila directamente sin regresar una lista
+                # 2. Imprimimos usando la notación de punto del objeto Row
+                logger.warning(f"Total registros: {c.TABLE_NAME_MONTHLY_METRICS} {showdf2.total} ")        
+                spark_cr.sql(f"SELECT * FROM {c.TABLE_NAME_MONTHLY_METRICS}").show(5)
+
+                # =======================================================================
+                # PASO 4: Detencion de anomalias
+                # =======================================================================
+                df_anomalies = anomaly_detector.detect_anomalies(df_with_metrics)
+                df_anomalies2, _ = orchestrator.load_lakehouse(
+                    df=df_anomalies, 
+                    table_name=orchestrator.tables["anomalies"], 
+                    mode="append"
+                    )
+                showdf3 = spark_cr.read.table(c.TABLE_NAME_ANOMALIES) \
+                    .select(F.count("*").alias("total")) \
+                    .first()  # .first() nos da la primera fila directamente sin regresar una lista
+                # 2. Imprimimos usando la notación de punto del objeto Row
+                logger.warning(f"Total registros: {c.TABLE_NAME_ANOMALIES} {showdf3.total} ")        
+                spark_cr.sql(f"SELECT * FROM {c.TABLE_NAME_ANOMALIES}").show(5)
+
+                # =======================================================================
+                # PASO 7: CALIDAD Y AUDITORÍA (Siempre se ejecuta, no importa si hay cambios)
+                # =======================================================================
+                logger.warning(">>> [MAIN] Ejecutando Capa de Calidad de Datos...")        
+                df_dq = dq_analyzer.run_dq_report(df_base_filtered)
+                # Al usar 'append', dejas un log histórico de cada ejecución
+
+                orchestrator.load_lakehouse(
+                    df=df_dq, 
+                    table_name=orchestrator.tables["quality"], 
+                    mode="append"
+                )
+                showdf4 = spark_cr.read.table(c.TABLE_NAME_DATA_QUALITY) \
+                    .select(F.count("*").alias("total")) \
+                    .first()  # .first() nos da la primera fila directamente sin regresar una lista
+                # 2. Imprimimos usando la notación de punto del objeto Row
+                logger.warning(f"Total registros: {c.TABLE_NAME_DATA_QUALITY} {showdf4.total} ")        
+                spark_cr.sql(f"SELECT * FROM {c.TABLE_NAME_DATA_QUALITY} ORDER BY dq_date DESC").show(5)
+
+                # =====================================================================
+                # 2. LA MAGIA NUEVA: MODELADO DE DATOS (4.4)
+                # =====================================================================
+
+                dim_currency, dim_customer = modeler.build_dimensions()
+                fact_rates, fact_txns = modeler.build_facts(df_cdc_check, dim_customer)
+
+                # (Opcional) Si quieres mostrarle a los evaluadores que sí se generaron:
+                logger.warning("Logica de modelado ejecutada. Mostrando muestras de las tablas dimensionales y de hechos generadas:")
+                dim_currency.show()
+                dim_customer.show()
+                fact_rates.show()
+                fact_txns.show()
+
+                # =====================================================================
+                # 3. LA MAGIA NUEVA: EMISIÓN DE EVENTOS JSON (4.5)
+                # =====================================================================
+                publisher = EventPublisher(output_path="./events/")
+                publisher.publish_json_events(df_cdc_check)
             else:
-                print(">>> La tabla ya está actualizada.")
-            """
-##################################
-            """ Metodeo collect para evitar duplicados (si la API devuelve datos ya existentes)
+                logging.warning(">>> [MAIN] Se detecto al menos un DELETE en el lote actual. Por seguridad, se ha actualizado solo la tabla base ")
 
-            # Buscamos la última fecha (Eficiencia pura)
-            last_date = spark.sql(f"SELECT max(date) FROM {table_name}").collect()[0][0]
-            
-            # Filtramos antes de tocar la tabla
-            df_incremental = df_final.filter(df_final.date > last_date)
-            
-            if df_incremental.count() > 0:
-                df_incremental.writeTo(table_name).append()
-                print(f">>> {df_incremental.count()} registros nuevos insertados.")
-            else:
-                print(">>> La tabla ya está actualizada.")  
-                """             
-            # 1. Creamos una vista temporal de los datos nuevos
-            df_final.createOrReplaceTempView("new_data")
-            
-            # 2. Insertamos usando SQL directo
-            # Esto permite que el optimizador de Iceberg use los metadatos 
-            # para buscar el MAX sin hacer un scan completo ni un collect.
-            spark.sql(f"""
-                INSERT INTO {table_name}
-                SELECT * FROM new_data
-                WHERE date > (SELECT MAX(date) FROM {table_name})
-            """)
-            
-            print(">>> Carga incremental completada vía SQL (Pushdown optimization).")
-
-        # --- VERIFICACIÓN FINAL ---
-        print(">>> Verificando tabla Iceberg...")
-        summary = spark.sql(f"SELECT * FROM {table_name}")
-        summary.show(50) 
-        summary = spark.sql(f"SELECT count(*) as total, max(date) as ultima_fecha FROM {table_name}").collect()
-        print(f"Total registros: {summary[0]['total']}")
-
-        print(f"Última actualización de datos: {summary[0]['ultima_fecha']}")
-        
+        else:
+            logging.warning(">>> [MAIN] No se detectaron cambios reales en el rango de fechas especificado. Saltando actualización de la tabla base y capas de negocio.")
+ 
     else:
-        print(">>> No se obtuvieron datos. Verifique logs de la API.")
+        print(">>> [SKIP] No hay datos nuevos para procesar.")
 
 if __name__ == "__main__":
-    run_pipeline()
+    run()

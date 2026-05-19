@@ -3,6 +3,7 @@ warehouse/
 derby.log
 metastore_db/
 checkpoint/
+events/
 
 # Python
 __pycache__/
